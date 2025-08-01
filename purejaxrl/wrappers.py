@@ -10,6 +10,9 @@ from brax import envs
 from brax.envs.wrappers.training import EpisodeWrapper, AutoResetWrapper
 import navix as nx
 
+from jaxmarl.wrappers.baselines import JaxMARLWrapper
+from jaxmarl.environments.multi_agent_env import MultiAgentEnv, State
+
 
 class GymnaxWrapper(object):
     """Base class for Gymnax wrappers."""
@@ -62,56 +65,104 @@ class FlattenObservationWrapper(GymnaxWrapper):
 
 @struct.dataclass
 class LogEnvState:
-    env_state: environment.EnvState
+    env_state: State
     episode_returns: float
     episode_lengths: int
     returned_episode_returns: float
     returned_episode_lengths: int
-    timestep: int
 
+class LogWrapper(JaxMARLWrapper):
+    """Log the episode returns and lengths.
+    NOTE for now for envs where agents terminate at the same time.
+    """
 
-class LogWrapper(GymnaxWrapper):
-    """Log the episode returns and lengths."""
-
-    def __init__(self, env: environment.Environment):
+    def __init__(self, env: MultiAgentEnv, replace_info: bool = False):
         super().__init__(env)
+        self.replace_info = replace_info
 
     @partial(jax.jit, static_argnums=(0,))
-    def reset(
-        self, key: chex.PRNGKey, params: Optional[environment.EnvParams] = None
-    ) -> Tuple[chex.Array, environment.EnvState]:
-        obs, env_state = self._env.reset(key, params)
-        state = LogEnvState(env_state, 0, 0, 0, 0, 0)
+    def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, State]:
+        obs, env_state = self._env.reset(key)
+        state = LogEnvState(
+            env_state,
+            jnp.zeros((self._env.num_agents,)),
+            jnp.zeros((self._env.num_agents,)),
+            jnp.zeros((self._env.num_agents,)),
+            jnp.zeros((self._env.num_agents,)),
+        )
         return obs, state
 
     @partial(jax.jit, static_argnums=(0,))
     def step(
         self,
         key: chex.PRNGKey,
-        state: environment.EnvState,
+        state: LogEnvState,
         action: Union[int, float],
-        params: Optional[environment.EnvParams] = None,
-    ) -> Tuple[chex.Array, environment.EnvState, float, bool, dict]:
+    ) -> Tuple[chex.Array, LogEnvState, float, bool, dict]:
         obs, env_state, reward, done, info = self._env.step(
-            key, state.env_state, action, params
+            key, state.env_state, action
         )
-        new_episode_return = state.episode_returns + reward
+        ep_done = done["__all__"]
+        new_episode_return = state.episode_returns + self._batchify_floats(reward)
         new_episode_length = state.episode_lengths + 1
         state = LogEnvState(
             env_state=env_state,
-            episode_returns=new_episode_return * (1 - done),
-            episode_lengths=new_episode_length * (1 - done),
-            returned_episode_returns=state.returned_episode_returns * (1 - done)
-            + new_episode_return * done,
-            returned_episode_lengths=state.returned_episode_lengths * (1 - done)
-            + new_episode_length * done,
-            timestep=state.timestep + 1,
+            episode_returns=new_episode_return * (1 - ep_done),
+            episode_lengths=new_episode_length * (1 - ep_done),
+            returned_episode_returns=state.returned_episode_returns * (1 - ep_done)
+            + new_episode_return * ep_done,
+            returned_episode_lengths=state.returned_episode_lengths * (1 - ep_done)
+            + new_episode_length * ep_done,
         )
+        if self.replace_info:
+            info = {}
         info["returned_episode_returns"] = state.returned_episode_returns
         info["returned_episode_lengths"] = state.returned_episode_lengths
-        info["timestep"] = state.timestep
-        info["returned_episode"] = done
+        info["returned_episode"] = jnp.full((self._env.num_agents,), ep_done)
         return obs, state, reward, done, info
+
+# class LogWrapper(GymnaxWrapper):
+#     """Log the episode returns and lengths."""
+
+#     def __init__(self, env: environment.Environment):
+#         super().__init__(env)
+
+#     @partial(jax.jit, static_argnums=(0,))
+#     def reset(
+#         self, key: chex.PRNGKey, params: Optional[environment.EnvParams] = None
+#     ) -> Tuple[chex.Array, environment.EnvState]:
+#         obs, env_state = self._env.reset(key, params)
+#         state = LogEnvState(env_state, 0, 0, 0, 0, 0)
+#         return obs, state
+
+#     @partial(jax.jit, static_argnums=(0,))
+#     def step(
+#         self,
+#         key: chex.PRNGKey,
+#         state: environment.EnvState,
+#         action: Union[int, float],
+#         params: Optional[environment.EnvParams] = None,
+#     ) -> Tuple[chex.Array, environment.EnvState, float, bool, dict]:
+#         obs, env_state, reward, done, info = self._env.step(
+#             key, state.env_state, action, params
+#         )
+#         new_episode_return = state.episode_returns + reward
+#         new_episode_length = state.episode_lengths + 1
+#         state = LogEnvState(
+#             env_state=env_state,
+#             episode_returns=new_episode_return * (1 - done),
+#             episode_lengths=new_episode_length * (1 - done),
+#             returned_episode_returns=state.returned_episode_returns * (1 - done)
+#             + new_episode_return * done,
+#             returned_episode_lengths=state.returned_episode_lengths * (1 - done)
+#             + new_episode_length * done,
+#             timestep=state.timestep + 1,
+#         )
+#         info["returned_episode_returns"] = state.returned_episode_returns
+#         info["returned_episode_lengths"] = state.returned_episode_lengths
+#         info["timestep"] = state.timestep
+#         info["returned_episode"] = done
+#         return obs, state, reward, done, info
 
 
 class BraxGymnaxWrapper:

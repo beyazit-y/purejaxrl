@@ -1,4 +1,5 @@
 import jax
+import token_env
 import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
@@ -11,42 +12,97 @@ import gymnax
 from wrappers import LogWrapper, FlattenObservationWrapper
 
 
-class ActorCritic(nn.Module):
-    action_dim: Sequence[int]
-    activation: str = "tanh"
+# class ActorCritic(nn.Module):
+#     action_dim: Sequence[int]
+#     activation: str = "tanh"
+
+#     @nn.compact
+#     def __call__(self, x):
+#         print(x)
+#         input()
+#         if self.activation == "relu":
+#             activation = nn.relu
+#         else:
+#             activation = nn.tanh
+#         actor_mean = nn.Dense(
+#             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+#         )(x)
+#         actor_mean = activation(actor_mean)
+#         actor_mean = nn.Dense(
+#             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+#         )(actor_mean)
+#         actor_mean = activation(actor_mean)
+#         actor_mean = nn.Dense(
+#             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+#         )(actor_mean)
+#         pi = distrax.Categorical(logits=actor_mean)
+
+#         critic = nn.Dense(
+#             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+#         )(x)
+#         critic = activation(critic)
+#         critic = nn.Dense(
+#             64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+#         )(critic)
+#         critic = activation(critic)
+#         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
+#             critic
+#         )
+
+#         return pi, jnp.squeeze(critic, axis=-1)
+
+class MarlTokenEnvFeaturesExtractor(nn.Module):
+    """Conv2D feature extractor with fixed architecture."""
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Conv(16, (2, 2), strides=(1, 1), kernel_init=orthogonal(np.sqrt(2)))(x)
+        x = nn.relu(x)
+        x = nn.Conv(32, (2, 2), strides=(1, 1), kernel_init=orthogonal(np.sqrt(2)))(x)
+        x = nn.relu(x)
+        x = nn.Conv(64, (2, 2), strides=(1, 1), kernel_init=orthogonal(np.sqrt(2)))(x)
+        x = nn.relu(x)
+        return x.reshape((x.shape[0], -1))  # Flatten (start_dim=1)
+
+
+class MLP(nn.Module):
+    dims: list[int]
+    activation: str = "relu"
 
     @nn.compact
     def __call__(self, x):
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
-        actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(actor_mean)
-        actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
-        pi = distrax.Categorical(logits=actor_mean)
+        act_fn = nn.relu if self.activation == "relu" else nn.tanh
+        for dim in self.dims:
+            x = nn.Dense(dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+            x = act_fn(x)
+        return x
 
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
-        critic = activation(critic)
-        critic = nn.Dense(
-            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(critic)
-        critic = activation(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
 
-        return pi, jnp.squeeze(critic, axis=-1)
+class ActorCritic(nn.Module):
+    action_dim: int
+    activation: str = "relu"
+
+    @nn.compact
+    def __call__(self, obs):
+        if obs.ndim == 3:  # (C, H, W)
+            obs = obs[None, ...]  # → (1, C, H, W)
+        elif obs.ndim != 4:
+            raise ValueError(f"Expected (C, H, W) or (B, C, H, W), got {obs.shape}")
+        # obs shape: (B, C, H, W)
+        # print(obs)
+        obs = jnp.transpose(obs, (0, 2, 3, 1))
+        # obs shape: (B, H, W, C)
+        # print(obs)
+        # input()
+        feat = MarlTokenEnvFeaturesExtractor()(obs)
+
+        policy_hidden = MLP([64, 64, 64], activation=self.activation)(feat)
+        value_hidden = MLP([64, 64], activation=self.activation)(feat)
+
+        logits = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(policy_hidden)
+        value = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(value_hidden)
+
+        pi = distrax.Categorical(logits=logits)
+        return pi, jnp.squeeze(value, axis=-1)
 
 
 class Transition(NamedTuple):
@@ -58,17 +114,28 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     info: jnp.ndarray
 
+def batchify(obss: dict, agents):
+    shape_without_batch = obss[agents[0]].shape[1:]
+    obss_batch = jnp.stack([obss[agent] for agent in agents])
+    return obss_batch.reshape((-1, *shape_without_batch))
+
+def unbatchify(actions: jnp.ndarray, agents, n_envs):
+    _actions = actions.reshape((len(agents), n_envs, -1)).squeeze()
+    return {agent: _actions[i] for i, agent in enumerate(agents)}
 
 def make_train(config):
+    # env, env_params = gymnax.make(config["ENV_NAME"])
+    env = token_env.TokenEnvJax()
+    # env_params = env.default_params
+    # env = FlattenObservationWrapper(env)
+    env = LogWrapper(env)
+    config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
     config["MINIBATCH_SIZE"] = (
-        config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
+        config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
-    env, env_params = gymnax.make(config["ENV_NAME"])
-    env = FlattenObservationWrapper(env)
-    env = LogWrapper(env)
 
     def linear_schedule(count):
         frac = (
@@ -81,10 +148,10 @@ def make_train(config):
     def train(rng):
         # INIT NETWORK
         network = ActorCritic(
-            env.action_space(env_params).n, activation=config["ACTIVATION"]
+            env.action_space(env.agents[0]).n, activation=config["ACTIVATION"]
         )
         rng, _rng = jax.random.split(rng)
-        init_x = jnp.zeros(env.observation_space(env_params).shape)
+        init_x = jnp.zeros(env.observation_space(env.agents[0]).shape)
         network_params = network.init(_rng, init_x)
         if config["ANNEAL_LR"]:
             tx = optax.chain(
@@ -105,7 +172,7 @@ def make_train(config):
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+        obsv, env_state = jax.vmap(env.reset)(reset_rng)
 
         # TRAIN LOOP
         def _update_step(runner_state, unused):
@@ -113,20 +180,29 @@ def make_train(config):
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, rng = runner_state
 
+                obs_batch = batchify(last_obs, env.agents)
+
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
-                pi, value = network.apply(train_state.params, last_obs)
+                pi, value = network.apply(train_state.params, obs_batch)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
+
+                env_act = unbatchify(action, env.agents, config["NUM_ENVS"])
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0, None)
-                )(rng_step, env_state, action, env_params)
+                obsv, env_state, reward, done, info = jax.vmap(env.step)(rng_step, env_state, env_act)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 transition = Transition(
-                    done, action, value, reward, log_prob, last_obs, info
+                    batchify(done, env.agents),
+                    action,
+                    value,
+                    batchify(reward, env.agents),
+                    log_prob,
+                    obs_batch,
+                    info
                 )
                 runner_state = (train_state, env_state, obsv, rng)
                 return runner_state, transition
@@ -137,7 +213,8 @@ def make_train(config):
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, rng = runner_state
-            _, last_val = network.apply(train_state.params, last_obs)
+            last_obs_batch = batchify(last_obs, env.agents)
+            _, last_val = network.apply(train_state.params, last_obs_batch)
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -220,18 +297,18 @@ def make_train(config):
                 # Batching and Shuffling
                 batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
                 assert (
-                    batch_size == config["NUM_STEPS"] * config["NUM_ENVS"]
+                    batch_size == config["NUM_STEPS"] * config["NUM_ACTORS"]
                 ), "batch size must be equal to number of steps * number of envs"
                 permutation = jax.random.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
-                batch = jax.tree_util.tree_map(
+                batch = jax.tree.map(
                     lambda x: x.reshape((batch_size,) + x.shape[2:]), batch
                 )
-                shuffled_batch = jax.tree_util.tree_map(
+                shuffled_batch = jax.tree.map(
                     lambda x: jnp.take(x, permutation, axis=0), batch
                 )
                 # Mini-batch Updates
-                minibatches = jax.tree_util.tree_map(
+                minibatches = jax.tree.map(
                     lambda x: jnp.reshape(
                         x, [config["NUM_MINIBATCHES"], -1] + list(x.shape[1:])
                     ),
@@ -255,7 +332,7 @@ def make_train(config):
             if config.get("DEBUG"):
                 def callback(info):
                     return_values = info["returned_episode_returns"][info["returned_episode"]]
-                    timesteps = info["timestep"][info["returned_episode"]] * config["NUM_ENVS"]
+                    timesteps = info["returned_episode_lengths"][info["returned_episode"]] * config["NUM_ENVS"]
                     for t in range(len(timesteps)):
                         print(f"global step={timesteps[t]}, episodic return={return_values[t]}")
                 jax.debug.callback(callback, metric)
