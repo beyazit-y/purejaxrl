@@ -11,6 +11,8 @@ import distrax
 import gymnax
 from wrappers import LogWrapper, FlattenObservationWrapper
 
+from collections import deque
+
 
 # class ActorCritic(nn.Module):
 #     action_dim: Sequence[int]
@@ -129,7 +131,8 @@ def make_train(config):
     # env_params = env.default_params
     # env = FlattenObservationWrapper(env)
     env = LogWrapper(env)
-    config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
+    config["NUM_AGENTS"] = env.num_agents
+    config["NUM_ACTORS"] = config["NUM_AGENTS"] * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -330,11 +333,14 @@ def make_train(config):
             
             # Debugging mode
             if config.get("DEBUG"):
+                return_buffer = deque(maxlen=100) # this is fine on the debug side
                 def callback(info):
                     return_values = info["returned_episode_returns"][info["returned_episode"]]
-                    timesteps = info["returned_episode_lengths"][info["returned_episode"]] * config["NUM_ENVS"]
-                    for t in range(len(timesteps)):
-                        print(f"global step={timesteps[t]}, episodic return={return_values[t]}")
+                    return_buffer.extend(return_values)
+                    timesteps = info["timestep"][-1, :]
+                    global_step = jnp.sum(timesteps) / config["NUM_AGENTS"]
+                    mean_return_value = float(np.mean(return_buffer))
+                    jax.debug.print(f"global step={global_step}, mean return={mean_return_value}", ordered=True)
                 jax.debug.callback(callback, metric)
 
             runner_state = (train_state, env_state, last_obs, rng)
